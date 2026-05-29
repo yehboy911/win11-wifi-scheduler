@@ -1,0 +1,10 @@
+{
+  "_help": {
+    "MaxDelayMinutes": "Get-Random -Maximum is exclusive: 10 = sleep 0-9 min; synced to Toggle-WiFi.ps1 by Install-Tasks.ps1",
+    "ConnectTimes": "Weekday connect trigger times; task WiFi-Connect (first entry only by default)",
+    "DisconnectTime": "Weekday disconnect; task WiFi-Disconnect"
+  },
+  "MaxDelayMinutes": 10,
+  "ConnectTimes": ["08:00"],
+  "DisconnectTime": "19:30"
+}

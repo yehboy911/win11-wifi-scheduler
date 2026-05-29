@@ -67,22 +67,12 @@ $SymbolFail   = [char]0x2717   # ✗
 # 註：已排除 lenovo-internet (captive portal 開放網路，要瀏覽器手動 sign-in)
 $PreferredSSIDs = @('lenovo-5G', 'lenovo')
 # 每個 SSID 給足時間完成 802.1X PEAP 認證 + DHCP + NCSI/L3 偵測
-$AssocWaitSec       = 90   # 首次 netsh connect 後等待 PEAP + DHCP + L3
-$AssocRetryWaitSec  = 45   # 第二次 connect 重試的等待（較短）
-$ConnectRetries     = 2    # 每個 SSID 重試 connect 次數（不用 wlan reconnect — Win11 常 exit=1）
-$OnlineSustainSec   = 6    # 連上 preferred SSID 且 L3 OK 需連續維持幾秒才算真成功
+$AssocWaitSec      = 90    # PEAP + DHCP + NCSI 在排程背景 session 常需更久
+$OnlineSustainSec  = 6     # 連上 preferred SSID 且 L3 OK 需連續維持幾秒才算真成功
 $PreConnectPauseSec = 3    # 強制 disconnect 後等待秒數，讓 802.1X 重新握手
 
 # ---------- Logging (UTF-8 BOM，Excel / 記事本友善) ----------
 $_utf8Log = New-Object System.Text.UTF8Encoding $true
-
-# 排程診斷：腳本一有啟動就寫一行（即使後續 SKIP/失敗也留痕跡）
-try {
-    $runAs = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $boot = '[{0}] {1,-10} BOOT       script started (user={2} runAs={3})' -f `
-        (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Action.ToUpper(), $env:USERNAME, $runAs
-    [System.IO.File]::AppendAllText($LogFile, $boot + "`r`n", $_utf8Log)
-} catch { }
 
 function Write-AuditLog {
     param(
@@ -94,7 +84,11 @@ function Write-AuditLog {
         $Action.ToUpper(), `
         $Status, `
         $Message
-    [System.IO.File]::AppendAllText($LogFile, $line + "`r`n", $_utf8Log)
+    if (Test-Path $LogFile) {
+        [System.IO.File]::AppendAllText($LogFile, $line + "`r`n", $_utf8Log)
+    } else {
+        [System.IO.File]::WriteAllText($LogFile, $line + "`r`n", $_utf8Log)
+    }
     Write-Verbose $line
 }
 
@@ -210,10 +204,9 @@ function Read-ProcessStreamBytes {
     $ms     = New-Object System.IO.MemoryStream
     $buffer = New-Object byte[] 8192
     while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-        $null = $ms.Write($buffer, 0, $read)
+        $ms.Write($buffer, 0, $read) | Out-Null
     }
-    # PS 5.1：ToArray() 常回傳 Object[]，List[byte].AddRange 需要明確 [byte[]]
-    return [byte[]]$ms.ToArray()
+    return $ms.ToArray()
 }
 
 function Invoke-NetshCapture {
@@ -233,9 +226,9 @@ function Invoke-NetshCapture {
     $errB = Read-ProcessStreamBytes -Stream $proc.StandardError.BaseStream
     $proc.WaitForExit()
 
-    $allBytes = New-Object 'System.Collections.Generic.List[byte]'
-    if ($outB.Length -gt 0) { [void]$allBytes.AddRange([byte[]]$outB) }
-    if ($errB.Length -gt 0) { [void]$allBytes.AddRange([byte[]]$errB) }
+    $allBytes = New-Object System.Collections.Generic.List[byte]
+    if ($outB) { $allBytes.AddRange($outB) }
+    if ($errB) { $allBytes.AddRange($errB) }
 
     [PSCustomObject]@{
         ExitCode = $proc.ExitCode
@@ -321,20 +314,18 @@ function Invoke-WiFiConnectAttempt {
         [string]$Ssid,
         [string]$IfaceName
     )
-    $argStr = 'wlan connect name="{0}" interface="{1}"' -f $Ssid, $IfaceName
-    for ($i = 1; $i -le $ConnectRetries; $i++) {
-        $label = if ($i -eq 1) { 'connect' } else { "connect-retry$i" }
-        Write-AuditLog -Status 'ASSOC' -Message "netsh $label '$Ssid' on '$IfaceName'"
-        $r = Invoke-NetshCapture -ArgString $argStr
+    $attempts = @(
+        @{ Label = 'connect';  Args = 'wlan connect name="{0}" interface="{1}"' -f $Ssid, $IfaceName },
+        @{ Label = 'reconnect'; Args = 'wlan reconnect name="{0}" interface="{1}"' -f $Ssid, $IfaceName }
+    )
+    foreach ($attempt in $attempts) {
+        Write-AuditLog -Status 'ASSOC' -Message "netsh $($attempt.Label) '$Ssid' on '$IfaceName'"
+        $r = Invoke-NetshCapture -ArgString $attempt.Args
         $flat = ($r.Output -replace "`r?`n", " | ")
         if ($flat) { Write-AuditLog -Status 'ASSOC' -Message "netsh output (exit=$($r.ExitCode)): $flat" }
-        $waitSec = if ($i -eq 1) { $AssocWaitSec } else { $AssocRetryWaitSec }
-        if (Wait-WiFiOnline -Seconds $waitSec) {
-            Write-AuditLog -Status 'ASSOC' -Message "online via '$Ssid' ($label)"
+        if (Wait-WiFiOnline -Seconds $AssocWaitSec) {
+            Write-AuditLog -Status 'ASSOC' -Message "online via '$Ssid' ($($attempt.Label))"
             return $true
-        }
-        if ($i -lt $ConnectRetries) {
-            Start-Sleep -Seconds 2
         }
     }
     return $false
@@ -347,16 +338,15 @@ function Invoke-WiFiAssociate {
         return $false
     }
 
-    $diag = Get-WifiLinkDiagnostics
-    Write-AuditLog -Status 'DIAG' -Message $diag
+    Write-AuditLog -Status 'DIAG' -Message (Get-WifiLinkDiagnostics)
 
     if (Test-PreferredWifiOnline) {
-        Write-AuditLog -Status 'ASSOC' -Message "already on preferred SSID with L3 ($diag)"
+        Write-AuditLog -Status 'ASSOC' -Message "already on preferred SSID with L3 ($(Get-WifiLinkDiagnostics))"
         return $true
     }
 
     # 清掉殘留關聯，強迫 802.1X 重新握手（解決 netsh exit=0 但 PEAP 未完成的狀況）
-    Write-AuditLog -Status 'ASSOC' -Message "not ready; disconnect then retry connect ($diag)"
+    Write-AuditLog -Status 'ASSOC' -Message "not ready; disconnect then retry connect ($(Get-WifiLinkDiagnostics))"
     $disc = Invoke-NetshCapture -ArgString ('wlan disconnect interface="{0}"' -f $ifaceName)
     $flat = ($disc.Output -replace "`r?`n", " | ")
     if ($flat) { Write-AuditLog -Status 'ASSOC' -Message "pre-connect disconnect (exit=$($disc.ExitCode)): $flat" }
@@ -421,13 +411,6 @@ if ($NoDelay) {
 # ---------- Final adapter action ----------
 try {
     if ($Action -eq 'Connect') {
-        $runAs = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        if ($runAs -match '^(NT AUTHORITY\\)?(SYSTEM|LOCAL SERVICE|NETWORK SERVICE)$') {
-            Write-AuditLog -Status 'ERROR' -Message "Connect refused: running as $runAs (PEAP needs Interactive user). Re-run Install-Tasks.ps1"
-            Update-DailySummary -WhichAction $Action -Result 'FAIL'
-            exit 1
-        }
-
         # 防呆：若 adapter 被外部 Disable 過 (例如手動操作)，先打開 radio
         $a = Get-NetAdapter -InterfaceDescription $AdapterDesc -ErrorAction SilentlyContinue
         if ($a -and $a.Status -eq 'Disabled') {
